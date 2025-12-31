@@ -1,0 +1,15 @@
+# Windows image files
+*.wim
+*.iso
+
+# Build artifacts
+Build/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+Temp/
+
+# PowerShell module cache
+*.psm1.cache
