@@ -19,6 +19,19 @@ return @{
         edition = "Windows 11 Pro"
     }
 
+    # Optional: Image validation using catalog files (Test-FileCatalog)
+    imageValidation = @{
+        enabled = $true
+        # catalogUrl is optional - auto-discovered by replacing .iso/.wim/.ffu with .cat
+        # catalogUrl = "https://mystorageaccount.blob.core.windows.net/images/Win11_23H2_Pro.cat"
+        requireValidCatalog = $false  # Set to $true to fail deployment if catalog validation fails
+        enableSignatureCheck = $true  # Verify catalog file signature
+        trustedPublishers = @(
+            "CN:Contoso Corporation"          # Certificate subject CN contains match
+            # "Thumbprint:A1B2C3D4E5F6..."    # Or exact certificate thumbprint
+        )
+    }
+
     diskConfiguration = @{
         diskNumber = 0
         partitionStyle = "GPT"

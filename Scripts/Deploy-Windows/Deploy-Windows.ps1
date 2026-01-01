@@ -576,6 +576,35 @@ function Test-DeploymentConfigurationStructure {
         }
     }
 
+    # Validate imageValidation section (optional, but validate structure if present)
+    if ($Config.imageValidation) {
+        $validation = $Config.imageValidation
+
+        # enabled must be boolean
+        if ($null -ne $validation.enabled -and $validation.enabled -isnot [bool]) {
+            $results.Issues += "imageValidation.enabled must be a boolean"
+            $results.Passed = $false
+        }
+
+        # requireValidCatalog must be boolean
+        if ($null -ne $validation.requireValidCatalog -and $validation.requireValidCatalog -isnot [bool]) {
+            $results.Issues += "imageValidation.requireValidCatalog must be a boolean"
+            $results.Passed = $false
+        }
+
+        # enableSignatureCheck must be boolean
+        if ($null -ne $validation.enableSignatureCheck -and $validation.enableSignatureCheck -isnot [bool]) {
+            $results.Issues += "imageValidation.enableSignatureCheck must be a boolean"
+            $results.Passed = $false
+        }
+
+        # trustedPublishers must be array
+        if ($validation.trustedPublishers -and $validation.trustedPublishers -isnot [array]) {
+            $results.Issues += "imageValidation.trustedPublishers must be an array"
+            $results.Passed = $false
+        }
+    }
+
     return $results
 }
 
@@ -1849,6 +1878,179 @@ try {
     Write-DeploymentLog "Image acquired successfully: $imagePath" -Level Info
     $imageSize = (Get-Item $imagePath).Length / 1GB
     Write-DeploymentLog "Image size: $([math]::Round($imageSize, 2)) GB" -Level Info
+
+    # =====================================================================
+    # PHASE 2.5: Validate Image Integrity
+    # =====================================================================
+
+    if ($config.imageValidation -and $config.imageValidation.enabled) {
+        Write-DeploymentLog "" -Level Info
+        Write-DeploymentLog "========================================" -Level Info
+        Write-DeploymentLog "  Validating Image Integrity" -Level Info
+        Write-DeploymentLog "========================================" -Level Info
+        Write-DeploymentLog "" -Level Info
+
+        $imageValidated = $false
+        $validationMethod = "none"
+
+        # Determine image file extension for catalog/hash discovery
+        $imageExtension = [System.IO.Path]::GetExtension($imagePath)
+        $imageBasePath = $imagePath -replace [regex]::Escape($imageExtension) + '$', ''
+
+        # Try catalog validation first
+        $catalogUrl = $config.imageValidation.catalogUrl
+        if (-not $catalogUrl) {
+            # Auto-discover catalog URL
+            $catalogUrl = $imageLocation -replace '\.(iso|wim|ffu)$', '.cat'
+            Write-DeploymentLog "Auto-discovered catalog URL: $catalogUrl" -Level Verbose
+        }
+
+        $catalogFile = "$imageBasePath.cat"
+        $hasCatalog = $false
+
+        try {
+            Write-DeploymentLog "Looking for image catalog file..." -Level Verbose
+
+            # Download catalog based on source type
+            if ($config.imageSource.location.blobUrl) {
+                # Azure Blob download
+                if ($config.imageSource.location.authType -eq "SAS") {
+                    $catalogDownload = Get-AzureBlobWithSAS -BlobUrl $catalogUrl `
+                                                            -SasToken $config.imageSource.location.sasToken `
+                                                            -Destination $catalogFile `
+                                                            -ShowProgress:$false
+                }
+                else {
+                    $catalogDownload = Get-AzureBlobAnonymous -BlobUrl $catalogUrl `
+                                                              -Destination $catalogFile `
+                                                              -ShowProgress:$false
+                }
+            }
+            elseif ($config.imageSource.location.uncPath) {
+                # SMB download
+                $uncCatalogPath = $catalogUrl
+                if ($config.imageSource.location.username -and $securePassword) {
+                    Get-SMBFile -UncPath $uncCatalogPath `
+                               -Destination $catalogFile `
+                               -Username $config.imageSource.location.username `
+                               -Password $securePassword `
+                               -ShowProgress:$false
+                }
+                else {
+                    Get-SMBFile -UncPath $uncCatalogPath `
+                               -Destination $catalogFile `
+                               -ShowProgress:$false
+                }
+            }
+            elseif ($config.imageSource.location.localPath) {
+                # Local file copy
+                $localCatalogPath = $catalogUrl
+                if (Test-Path $localCatalogPath) {
+                    Copy-Item -Path $localCatalogPath -Destination $catalogFile -Force
+                }
+            }
+
+            if (Test-Path $catalogFile) {
+                Write-DeploymentLog "Catalog file found" -Level Info
+                $hasCatalog = $true
+            }
+        }
+        catch {
+            Write-DeploymentLog "Could not download catalog file: $($_.Exception.Message)" -Level Verbose
+        }
+
+        # Validate catalog if found
+        if ($hasCatalog) {
+            try {
+                # Validate catalog signature if enabled
+                if ($config.imageValidation.enableSignatureCheck) {
+                    Write-DeploymentLog "Verifying catalog signature..." -Level Verbose
+
+                    $catalogSignature = Get-AuthenticodeSignature -FilePath $catalogFile -ErrorAction Stop
+
+                    if ($catalogSignature.Status -ne "Valid") {
+                        Write-DeploymentLog "WARNING: Catalog signature invalid: $($catalogSignature.Status)" -Level Warning
+
+                        if ($config.imageValidation.requireValidCatalog) {
+                            throw "Catalog signature validation failed and requireValidCatalog is true"
+                        }
+                        $hasCatalog = $false
+                    }
+                    else {
+                        # Verify trusted publisher
+                        $signerCert = $catalogSignature.SignerCertificate
+                        $isTrusted = $false
+
+                        foreach ($publisher in $config.imageValidation.trustedPublishers) {
+                            if ($publisher -match '^Thumbprint:(.+)$') {
+                                if ($signerCert.Thumbprint -eq $matches[1]) {
+                                    $isTrusted = $true
+                                    Write-DeploymentLog "Catalog signed by trusted thumbprint" -Level Verbose
+                                    break
+                                }
+                            }
+                            elseif ($publisher -match '^CN:(.+)$') {
+                                if ($signerCert.Subject -like "*CN=$($matches[1])*") {
+                                    $isTrusted = $true
+                                    Write-DeploymentLog "Catalog signed by trusted CN: $($matches[1])" -Level Verbose
+                                    break
+                                }
+                            }
+                        }
+
+                        if (-not $isTrusted) {
+                            Write-DeploymentLog "WARNING: Catalog signer not in trusted publishers" -Level Warning
+                            if ($config.imageValidation.requireValidCatalog) {
+                                throw "Catalog signer not trusted and requireValidCatalog is true"
+                            }
+                            $hasCatalog = $false
+                        }
+                    }
+                }
+
+                # Run Test-FileCatalog
+                if ($hasCatalog) {
+                    Write-DeploymentLog "Validating image with catalog..." -Level Info
+
+                    $catalogResult = Test-FileCatalog -Path $imagePath `
+                                                     -CatalogFilePath $catalogFile `
+                                                     -Detailed `
+                                                     -ErrorAction Stop
+
+                    if ($catalogResult.Status -eq "Valid") {
+                        Write-DeploymentLog "Image catalog validation PASSED" -Level Info
+                        $imageValidated = $true
+                        $validationMethod = "catalog"
+                    }
+                    else {
+                        Write-DeploymentLog "Catalog validation FAILED: $($catalogResult.Status)" -Level Warning
+
+                        if ($config.imageValidation.requireValidCatalog) {
+                            throw "Image catalog validation failed and requireValidCatalog is true"
+                        }
+                    }
+                }
+            }
+            catch {
+                Write-DeploymentLog "Catalog validation error: $($_.Exception.Message)" -Level Warning
+
+                if ($config.imageValidation.requireValidCatalog) {
+                    throw "Image validation required but failed: $($_.Exception.Message)"
+                }
+            }
+            finally {
+                # Cleanup catalog file
+                if (Test-Path $catalogFile) {
+                    Remove-Item $catalogFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        Write-DeploymentLog "" -Level Info
+        Write-DeploymentLog "Image validation complete: $validationMethod" -Level Info
+        Write-DeploymentLog "" -Level Info
+    }
+
     #endregion
 
     #region Disk Preparation Phase

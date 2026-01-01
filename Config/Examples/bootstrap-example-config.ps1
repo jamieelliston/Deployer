@@ -1,6 +1,10 @@
 # Bootstrap configuration example
 # Downloads and validates deployment package from Azure Blob
-# Validates package hash and Deploy-Windows.ps1 script signature
+#
+# Validation chain (in order):
+# 1. Catalog validation (if .cat file found) - Uses Test-FileCatalog
+# 2. Package hash validation (fallback if catalog not available)
+# 3. Deploy-Windows.ps1 script signature validation
 #
 # This configuration file can be signed with Authenticode signatures
 

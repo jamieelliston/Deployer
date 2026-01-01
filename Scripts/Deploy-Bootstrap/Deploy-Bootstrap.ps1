@@ -617,11 +617,94 @@ function Update-Bootstrap {
         }
 
         # Validate package
+        $hashValidationRequired = $true
+
         if ($hasCatalogFile) {
-            # TODO: Implement catalog-based validation using Test-FileCatalog
-            Write-DeploymentLog "Catalog validation not yet implemented - skipping" -Level Warning
+            Write-DeploymentLog "Validating bootstrap package using catalog file..." -Level Info
+
+            try {
+                # Validate catalog signature if signature checking enabled
+                if ($Config.validation.enableSignatureCheck) {
+                    Write-DeploymentLog "Verifying catalog file signature..." -Level Verbose
+
+                    $catalogSignature = Get-AuthenticodeSignature -FilePath $catalogFile -ErrorAction Stop
+
+                    if ($catalogSignature.Status -ne "Valid") {
+                        Write-DeploymentLog "Catalog signature invalid: $($catalogSignature.Status)" -Level Warning
+                        Write-DeploymentLog "Falling back to hash file validation" -Level Info
+                        $hasCatalogFile = $false
+                    }
+                    else {
+                        # Verify signer is trusted
+                        $signerCert = $catalogSignature.SignerCertificate
+                        $isTrustedSigner = $false
+
+                        foreach ($trustedPublisher in $Config.validation.trustedPublishers) {
+                            if ($trustedPublisher -match '^Thumbprint:(.+)$') {
+                                $thumbprint = $matches[1]
+                                if ($signerCert.Thumbprint -eq $thumbprint) {
+                                    $isTrustedSigner = $true
+                                    Write-DeploymentLog "Catalog signed by trusted thumbprint: $thumbprint" -Level Verbose
+                                    break
+                                }
+                            }
+                            elseif ($trustedPublisher -match '^CN:(.+)$') {
+                                $cnPattern = $matches[1]
+                                if ($signerCert.Subject -like "*CN=$cnPattern*") {
+                                    $isTrustedSigner = $true
+                                    Write-DeploymentLog "Catalog signed by trusted CN: $cnPattern" -Level Verbose
+                                    break
+                                }
+                            }
+                        }
+
+                        if (-not $isTrustedSigner) {
+                            Write-DeploymentLog "Catalog signer not in trusted publishers list" -Level Warning
+                            Write-DeploymentLog "  Signer: $($signerCert.Subject)" -Level Warning
+                            Write-DeploymentLog "Falling back to hash file validation" -Level Info
+                            $hasCatalogFile = $false
+                        }
+                    }
+                }
+
+                # Perform catalog validation if signature valid (or signature check disabled)
+                if ($hasCatalogFile) {
+                    Write-DeploymentLog "Running Test-FileCatalog validation..." -Level Verbose
+
+                    $catalogResult = Test-FileCatalog -Path $bootstrapZip `
+                                                     -CatalogFilePath $catalogFile `
+                                                     -Detailed `
+                                                     -ErrorAction Stop
+
+                    if ($catalogResult.Status -eq "Valid") {
+                        Write-DeploymentLog "Bootstrap package catalog validation PASSED" -Level Info
+                        $hashValidationRequired = $false  # Skip hash validation
+                    }
+                    else {
+                        Write-DeploymentLog "Catalog validation FAILED: $($catalogResult.Status)" -Level Warning
+
+                        # Show validation details
+                        if ($catalogResult.CatalogItems) {
+                            foreach ($item in $catalogResult.CatalogItems) {
+                                if ($item.Status -ne "Valid") {
+                                    Write-DeploymentLog "  Invalid: $($item.FileName) - $($item.Status)" -Level Warning
+                                }
+                            }
+                        }
+
+                        Write-DeploymentLog "Falling back to hash file validation" -Level Info
+                        $hasCatalogFile = $false
+                    }
+                }
+            }
+            catch {
+                Write-DeploymentLog "Catalog validation error: $($_.Exception.Message)" -Level Warning
+                Write-DeploymentLog "Falling back to hash file validation" -Level Info
+                $hasCatalogFile = $false
+            }
         }
-        elseif ($Config.bootstrapUpdate.requireValidSignature -or $Config.validation.enableSignatureCheck) {
+
+        if ((-not $hasCatalogFile -or $hashValidationRequired) -and ($Config.bootstrapUpdate.requireValidSignature -or $Config.validation.enableSignatureCheck)) {
             # Fall back to hash file validation
             Write-DeploymentLog "Validating bootstrap package with hash file..." -Level Info
 
