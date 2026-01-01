@@ -83,6 +83,9 @@ $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Store test mode in script scope for embedded functions to access
 $script:TestMode = $TestMode.IsPresent
 
+# Bootstrap Script Version
+$BOOTSTRAP_VERSION = "1.0.0"
+
 # Default to bootstrap-config.ps1 in script directory if not specified
 if (-not $ConfigPath) {
     $ConfigPath = Join-Path $ScriptRoot "bootstrap-config.ps1"
@@ -295,6 +298,396 @@ function Get-TemporaryPath {
     Write-DeploymentLog "Created temporary directory: $tempPath" -Level Verbose
 
     return $tempPath
+}
+
+# Download a file from any supported URL type
+function Get-BootstrapFile {
+    <#
+    .SYNOPSIS
+        Download a file from any supported URL type
+    .PARAMETER Url
+        Source URL (Azure Blob, HTTP/HTTPS, SMB/UNC, Local path)
+    .PARAMETER Destination
+        Local destination file path
+    .PARAMETER AuthType
+        Authentication type: "Anonymous", "SAS", "None"
+    .PARAMETER SasToken
+        SAS token if AuthType is "SAS"
+    .OUTPUTS
+        Boolean indicating success
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+
+        [Parameter(Mandatory = $false)]
+        [string]$AuthType = "Anonymous",
+
+        [Parameter(Mandatory = $false)]
+        [string]$SasToken = $null
+    )
+
+    try {
+        # Detect URL type and route to appropriate download method
+        if ($Url -match '^https?://.*\.blob\.core\.windows\.net/') {
+            # Azure Blob Storage
+            Write-DeploymentLog "  Downloading from Azure Blob Storage..." -Level Verbose
+
+            if ($AuthType -eq "SAS") {
+                # Extract or use provided SAS token
+                $token = if ($Url -match '\?(.+)$') { $matches[1] } else { $SasToken }
+                Get-AzureBlobWithSAS -BlobUrl $Url -SasToken $token -Destination $Destination
+            }
+            else {
+                # Anonymous
+                Get-AzureBlobAnonymous -BlobUrl $Url -Destination $Destination
+            }
+        }
+        elseif ($Url -match '^https?://') {
+            # Generic HTTP/HTTPS
+            Write-DeploymentLog "  Downloading from HTTP/HTTPS..." -Level Verbose
+
+            # Use Invoke-WebRequest for generic HTTP downloads
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -ErrorAction Stop
+            $ProgressPreference = 'Continue'
+        }
+        elseif ($Url -match '^\\\\' -or $Url -match '^[A-Za-z]:') {
+            # UNC path or local path
+            Write-DeploymentLog "  Copying from local/UNC path..." -Level Verbose
+
+            if (Test-Path $Url) {
+                Copy-Item -Path $Url -Destination $Destination -Force -ErrorAction Stop
+            }
+            else {
+                throw "Source file not found: $Url"
+            }
+        }
+        else {
+            throw "Unsupported URL format: $Url"
+        }
+
+        # Verify download
+        if (Test-Path $Destination) {
+            Write-DeploymentLog "  Download successful: $([math]::Round((Get-Item $Destination).Length / 1KB, 2)) KB" -Level Verbose
+            return $true
+        }
+        else {
+            Write-DeploymentLog "  Download failed - file not created" -Level Error
+            return $false
+        }
+    }
+    catch {
+        Write-DeploymentLog "  Download failed: $($_.Exception.Message)" -Level Error
+        return $false
+    }
+}
+
+# Compare two semantic version strings
+function Compare-SemanticVersion {
+    <#
+    .SYNOPSIS
+        Compare two semantic version strings
+    .PARAMETER Version1
+        First version (e.g., "1.0.0")
+    .PARAMETER Version2
+        Second version (e.g., "1.1.0")
+    .OUTPUTS
+        Returns: -1 if Version1 < Version2
+                  0 if Version1 = Version2
+                  1 if Version1 > Version2
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version1,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Version2
+    )
+
+    # Parse versions
+    $v1Parts = $Version1 -split '\.'
+    $v2Parts = $Version2 -split '\.'
+
+    # Ensure 3 parts (Major.Minor.Patch)
+    while ($v1Parts.Count -lt 3) { $v1Parts += "0" }
+    while ($v2Parts.Count -lt 3) { $v2Parts += "0" }
+
+    # Compare each part
+    for ($i = 0; $i -lt 3; $i++) {
+        $v1Num = [int]$v1Parts[$i]
+        $v2Num = [int]$v2Parts[$i]
+
+        if ($v1Num -lt $v2Num) { return -1 }
+        if ($v1Num -gt $v2Num) { return 1 }
+    }
+
+    return 0  # Equal
+}
+
+# Check if a newer bootstrap version is available
+function Test-BootstrapUpdate {
+    <#
+    .SYNOPSIS
+        Check if a newer bootstrap version is available
+    .PARAMETER Config
+        Bootstrap configuration hashtable
+    .PARAMETER CurrentVersion
+        Current bootstrap version
+    .PARAMETER BootstrapUrl
+        URL to bootstrap package
+    .PARAMETER AuthType
+        Authentication type
+    .PARAMETER SasToken
+        SAS token if using SAS authentication
+    .OUTPUTS
+        Hashtable with update information
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Config,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentVersion,
+
+        [Parameter(Mandatory = $true)]
+        [string]$BootstrapUrl,
+
+        [Parameter(Mandatory = $false)]
+        [string]$AuthType = "Anonymous",
+
+        [Parameter(Mandatory = $false)]
+        [string]$SasToken = $null
+    )
+
+    $result = @{
+        UpdateAvailable = $false
+        NewVersion = $null
+        VersionFileUrl = $null
+        BootstrapZipUrl = $null
+        VersionMetadata = $null
+    }
+
+    Write-DeploymentLog "Checking for bootstrap updates..." -Level Info
+    Write-DeploymentLog "  Current version: $CurrentVersion" -Level Info
+    Write-DeploymentLog "  Package URL: $BootstrapUrl" -Level Info
+
+    $result.BootstrapZipUrl = $BootstrapUrl
+
+    # Determine version file location
+    $versionFileUrl = if ($Config.bootstrapUpdate -and $Config.bootstrapUpdate.versionFileUrl) {
+        $Config.bootstrapUpdate.versionFileUrl
+    } else {
+        # Auto-construct: replace .zip with -version.ps1
+        $BootstrapUrl -replace '\.zip$', '-version.ps1'
+    }
+
+    Write-DeploymentLog "  Version file: $versionFileUrl" -Level Verbose
+    $result.VersionFileUrl = $versionFileUrl
+
+    # Download version file
+    $versionFile = Get-TemporaryPath -Prefix "BootstrapVersion_"
+    $versionFile = "$versionFile.ps1"
+
+    try {
+        # Use universal download helper
+        $downloadSuccess = Get-BootstrapFile -Url $versionFileUrl -Destination $versionFile -AuthType $AuthType -SasToken $SasToken
+
+        if (-not $downloadSuccess -or -not (Test-Path $versionFile)) {
+            Write-DeploymentLog "Version file not found - assuming no update available" -Level Verbose
+            return $result
+        }
+
+        # Load version metadata
+        try {
+            $versionMetadata = & $versionFile
+            $result.VersionMetadata = $versionMetadata
+            $newVersion = $versionMetadata.version
+
+            Write-DeploymentLog "  Available version: $newVersion" -Level Info
+
+            # Compare versions
+            $comparison = Compare-SemanticVersion -Version1 $CurrentVersion -Version2 $newVersion
+
+            if ($comparison -lt 0) {
+                # Current version is older
+                Write-DeploymentLog "Newer bootstrap version available: $newVersion" -Level Info
+                $result.UpdateAvailable = $true
+                $result.NewVersion = $newVersion
+            }
+            elseif ($comparison -eq 0) {
+                Write-DeploymentLog "Bootstrap is up to date" -Level Info
+            }
+            else {
+                Write-DeploymentLog "Current version is newer than available version" -Level Warning
+            }
+        }
+        catch {
+            Write-DeploymentLog "Failed to parse version file: $($_.Exception.Message)" -Level Verbose
+            return $result
+        }
+    }
+    catch {
+        Write-DeploymentLog "Failed to check version file: $($_.Exception.Message)" -Level Verbose
+        return $result
+    }
+    finally {
+        # Cleanup version file
+        if (Test-Path $versionFile) {
+            Remove-Item -Path $versionFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $result
+}
+
+# Download and apply bootstrap update
+function Update-Bootstrap {
+    <#
+    .SYNOPSIS
+        Download and apply bootstrap update
+    .PARAMETER Config
+        Bootstrap configuration hashtable
+    .PARAMETER UpdateInfo
+        Update information from Test-BootstrapUpdate
+    .OUTPUTS
+        Path to new bootstrap script, or $null if update failed
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Config,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$UpdateInfo
+    )
+
+    Write-DeploymentLog "Downloading bootstrap update..." -Level Info
+    Write-DeploymentLog "  Version: $($UpdateInfo.NewVersion)" -Level Info
+
+    # Create temp directory for update
+    $updateDir = Get-TemporaryPath -Prefix "BootstrapUpdate_"
+    if (-not (Test-Path $updateDir)) {
+        New-Item -Path $updateDir -ItemType Directory -Force | Out-Null
+    }
+
+    $bootstrapZip = Join-Path $updateDir "DeployBootstrap.zip"
+
+    try {
+        # Download bootstrap package using universal helper
+        $authType = if ($Config.bootstrapUpdate.authType) {
+            $Config.bootstrapUpdate.authType
+        } else {
+            "Anonymous"
+        }
+
+        $sasToken = $Config.bootstrapUpdate.sasToken
+
+        $downloadSuccess = Get-BootstrapFile -Url $UpdateInfo.BootstrapZipUrl -Destination $bootstrapZip -AuthType $authType -SasToken $sasToken
+
+        if (-not $downloadSuccess -or -not (Test-Path $bootstrapZip)) {
+            Write-DeploymentLog "Failed to download bootstrap update" -Level Error
+            return $null
+        }
+
+        Write-DeploymentLog "Bootstrap package downloaded: $([math]::Round((Get-Item $bootstrapZip).Length / 1MB, 2)) MB" -Level Info
+
+        # Look for catalog file (.cat) for signature validation
+        $catalogFileUrl = $UpdateInfo.BootstrapZipUrl -replace '\.zip$', '.cat'
+        $catalogFile = Join-Path $updateDir "DeployBootstrap.cat"
+
+        $hasCatalogFile = $false
+        try {
+            Write-DeploymentLog "Looking for catalog file: $catalogFileUrl" -Level Verbose
+            $catDownload = Get-BootstrapFile -Url $catalogFileUrl -Destination $catalogFile -AuthType $authType -SasToken $sasToken
+
+            if ($catDownload -and (Test-Path $catalogFile)) {
+                Write-DeploymentLog "Catalog file found" -Level Info
+                $hasCatalogFile = $true
+            }
+        }
+        catch {
+            Write-DeploymentLog "Catalog file not found (optional): $($_.Exception.Message)" -Level Verbose
+        }
+
+        # Validate package
+        if ($hasCatalogFile) {
+            # TODO: Implement catalog-based validation using Test-FileCatalog
+            Write-DeploymentLog "Catalog validation not yet implemented - skipping" -Level Warning
+        }
+        elseif ($Config.bootstrapUpdate.requireValidSignature -or $Config.validation.enableSignatureCheck) {
+            # Fall back to hash file validation
+            Write-DeploymentLog "Validating bootstrap package with hash file..." -Level Info
+
+            # Download hash file
+            $hashFileUrl = if ($Config.bootstrapUpdate -and $Config.bootstrapUpdate.hashFileUrl) {
+                $Config.bootstrapUpdate.hashFileUrl
+            } else {
+                $UpdateInfo.BootstrapZipUrl -replace '\.zip$', '.ps1'
+            }
+
+            $hashFile = Join-Path $updateDir "DeployBootstrap.ps1"
+
+            try {
+                # Download hash file using universal helper
+                $hashDownloadSuccess = Get-BootstrapFile -Url $hashFileUrl -Destination $hashFile -AuthType $authType -SasToken $sasToken
+
+                if ($hashDownloadSuccess -and (Test-Path $hashFile)) {
+                    # Load expected hash
+                    $expectedHashInfo = & $hashFile
+
+                    # Calculate actual hash
+                    $actualHash = Get-FileHash -Path $bootstrapZip -Algorithm $expectedHashInfo.algorithm
+
+                    if ($actualHash.Hash -ne $expectedHashInfo.hash) {
+                        throw "Bootstrap package hash mismatch! Expected: $($expectedHashInfo.hash), Actual: $($actualHash.Hash)"
+                    }
+
+                    Write-DeploymentLog "Bootstrap package hash validated" -Level Info
+                }
+                else {
+                    Write-DeploymentLog "Hash file not found - skipping validation" -Level Warning
+                }
+            }
+            catch {
+                Write-DeploymentLog "Hash validation failed: $($_.Exception.Message)" -Level Error
+                return $null
+            }
+        }
+
+        # Extract bootstrap package
+        Write-DeploymentLog "Extracting bootstrap update..." -Level Info
+        $extractPath = Join-Path $updateDir "Extracted"
+
+        try {
+            Expand-Archive -Path $bootstrapZip -DestinationPath $extractPath -Force
+        }
+        catch {
+            Write-DeploymentLog "Failed to extract bootstrap package: $($_.Exception.Message)" -Level Error
+            return $null
+        }
+
+        # Find new Deploy-Bootstrap.ps1
+        $newBootstrapScript = Get-ChildItem -Path $extractPath -Filter "Deploy-Bootstrap.ps1" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if (-not $newBootstrapScript) {
+            Write-DeploymentLog "Deploy-Bootstrap.ps1 not found in update package" -Level Error
+            return $null
+        }
+
+        Write-DeploymentLog "Bootstrap update extracted successfully" -Level Info
+        return $newBootstrapScript.FullName
+    }
+    catch {
+        Write-DeploymentLog "Bootstrap update failed: $($_.Exception.Message)" -Level Error
+        return $null
+    }
 }
 
 # Show deployment progress
@@ -663,6 +1056,36 @@ function Test-BootstrapConfigurationStructure {
     if ($Config.logging) {
         if ($Config.logging.logLevel -and $Config.logging.logLevel -notin @('Verbose', 'Info', 'Warning', 'Error')) {
             $results.Issues += "Invalid logging.logLevel: $($Config.logging.logLevel)"
+            $results.Passed = $false
+        }
+    }
+
+    # Validate bootstrapUpdate section (optional, but validate if present)
+    # Note: Update check always runs, so this section is entirely optional
+    if ($Config.bootstrapUpdate) {
+        # All fields are optional - only validate types if present
+        if ($Config.bootstrapUpdate.packageUrl -and $Config.bootstrapUpdate.packageUrl -isnot [string]) {
+            $results.Issues += "bootstrapUpdate.packageUrl must be a string"
+            $results.Passed = $false
+        }
+
+        if ($Config.bootstrapUpdate.authType -and $Config.bootstrapUpdate.authType -isnot [string]) {
+            $results.Issues += "bootstrapUpdate.authType must be a string"
+            $results.Passed = $false
+        }
+
+        if ($null -ne $Config.bootstrapUpdate.requireValidSignature -and $Config.bootstrapUpdate.requireValidSignature -isnot [bool]) {
+            $results.Issues += "bootstrapUpdate.requireValidSignature must be a boolean"
+            $results.Passed = $false
+        }
+
+        if ($null -ne $Config.bootstrapUpdate.enableVersionCheck -and $Config.bootstrapUpdate.enableVersionCheck -isnot [bool]) {
+            $results.Issues += "bootstrapUpdate.enableVersionCheck must be a boolean"
+            $results.Passed = $false
+        }
+
+        if ($null -ne $Config.bootstrapUpdate.forceUpdate -and $Config.bootstrapUpdate.forceUpdate -isnot [bool]) {
+            $results.Issues += "bootstrapUpdate.forceUpdate must be a boolean"
             $results.Passed = $false
         }
     }
@@ -1479,6 +1902,111 @@ try {
         throw "Configuration validation failed. See log for details."
     }
     Write-DeploymentLog "Configuration validation passed" -Level Info
+    #endregion
+
+    #region Bootstrap Self-Update Check
+    Write-DeploymentLog "===== BOOTSTRAP UPDATE CHECK =====" -Level Info
+
+    # Auto-discover update location
+    $bootstrapUrl = $null
+
+    # 1. Check config for explicit packageUrl
+    if ($config.bootstrapUpdate -and $config.bootstrapUpdate.packageUrl) {
+        $bootstrapUrl = $config.bootstrapUpdate.packageUrl
+        Write-DeploymentLog "Using configured bootstrap URL: $bootstrapUrl" -Level Verbose
+    }
+    # 2. Auto-derive from packageSource
+    elseif ($config.packageSource.blobUrl) {
+        $bootstrapUrl = $config.packageSource.blobUrl -replace 'DeploymentPackage\.zip$', 'DeployBootstrap.zip'
+        Write-DeploymentLog "Auto-derived bootstrap URL: $bootstrapUrl" -Level Verbose
+    }
+    elseif ($config.packageSource.uncPath) {
+        $bootstrapUrl = $config.packageSource.uncPath -replace 'DeploymentPackage\.zip$', 'DeployBootstrap.zip'
+        Write-DeploymentLog "Auto-derived bootstrap URL: $bootstrapUrl" -Level Verbose
+    }
+
+    if ($bootstrapUrl) {
+        # Determine auth type
+        $updateAuthType = if ($config.bootstrapUpdate -and $config.bootstrapUpdate.authType) {
+            $config.bootstrapUpdate.authType
+        } else {
+            $config.packageSource.authType
+        }
+
+        $updateSasToken = if ($updateAuthType -eq "SAS") {
+            if ($config.bootstrapUpdate -and $config.bootstrapUpdate.sasToken) {
+                $config.bootstrapUpdate.sasToken
+            }
+            else {
+                $config.packageSource.sasToken
+            }
+        } else {
+            $null
+        }
+
+        # Attempt update check (non-fatal if fails)
+        try {
+            $updateInfo = Test-BootstrapUpdate -Config $config -CurrentVersion $BOOTSTRAP_VERSION -BootstrapUrl $bootstrapUrl -AuthType $updateAuthType -SasToken $updateSasToken
+
+            if ($updateInfo.UpdateAvailable) {
+                Write-Host ""
+                Write-Host "========================================" -ForegroundColor Yellow
+                Write-Host "  Bootstrap Update Available" -ForegroundColor Yellow
+                Write-Host "========================================" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "Current version:   $BOOTSTRAP_VERSION" -ForegroundColor White
+                Write-Host "Available version: $($updateInfo.NewVersion)" -ForegroundColor Cyan
+                Write-Host ""
+
+                # Download and apply update
+                $newBootstrapScript = Update-Bootstrap -Config $config -UpdateInfo $updateInfo
+
+                if ($newBootstrapScript) {
+                    Write-Host "Bootstrap updated successfully!" -ForegroundColor Green
+                    Write-Host "Restarting with new version..." -ForegroundColor Yellow
+                    Write-Host ""
+
+                    Write-DeploymentLog "Restarting with updated bootstrap: $newBootstrapScript" -Level Info
+
+                    # Build new command line (preserve all parameters)
+                    $newParams = @{
+                        ConfigPath = $ConfigPath
+                    }
+
+                    if ($LaunchDeployment) {
+                        $newParams.LaunchDeployment = $true
+                    }
+
+                    if ($DeploymentConfigPath) {
+                        $newParams.DeploymentConfigPath = $DeploymentConfigPath
+                    }
+
+                    if ($TestMode) {
+                        $newParams.TestMode = $true
+                    }
+
+                    # Execute new bootstrap script
+                    & $newBootstrapScript @newParams
+
+                    # Exit current script (new version is now running)
+                    Write-DeploymentLog "Exiting current bootstrap version" -Level Info
+                    exit 0
+                }
+                else {
+                    Write-Host "Bootstrap update failed - continuing with current version" -ForegroundColor Yellow
+                    Write-DeploymentLog "Update failed - continuing with version $BOOTSTRAP_VERSION" -Level Warning
+                }
+            } else {
+                Write-DeploymentLog "No bootstrap update available" -Level Info
+            }
+        }
+        catch {
+            Write-DeploymentLog "Bootstrap update check failed (non-fatal): $($_.Exception.Message)" -Level Warning
+            Write-DeploymentLog "Continuing with current version" -Level Info
+        }
+    } else {
+        Write-DeploymentLog "No bootstrap update location found - skipping update check" -Level Verbose
+    }
     #endregion
 
     #region Package Download

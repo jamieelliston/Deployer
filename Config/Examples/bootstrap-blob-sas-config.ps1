@@ -28,4 +28,15 @@ return @{
         logPath = "X:\Deploy\Logs\Bootstrap.log"
         logLevel = "Info"
     }
+
+    # Bootstrap self-update configuration (optional)
+    bootstrapUpdate = @{
+        enabled = $false                    # Set to $true to enable automatic bootstrap updates
+        packageUrl = "https://mystorageaccount.blob.core.windows.net/deployment/DeployBootstrap.zip"
+        authType = "SAS"                    # Use SAS token authentication
+        sasToken = "sp=r&st=2024-01-01T00:00:00Z&se=2024-12-31T23:59:59Z&sv=2023-01-03&sr=b&sig=SAMPLE_SIGNATURE"
+        requireValidSignature = $true
+        enableVersionCheck = $true
+        forceUpdate = $false
+    }
 }

@@ -26,4 +26,16 @@ return @{
         logPath = "X:\Deploy\Logs\Bootstrap.log"
         logLevel = "Info"
     }
+
+    # Bootstrap self-update configuration (optional)
+    bootstrapUpdate = @{
+        enabled = $false                    # Set to $true to enable automatic bootstrap updates
+        packageUrl = "https://mystorageaccount.blob.core.windows.net/deployment/DeployBootstrap.zip"
+        authType = "Anonymous"              # No authentication required
+        # versionFileUrl = $null            # Auto-constructed: DeployBootstrap-version.ps1
+        # hashFileUrl = $null               # Auto-constructed: DeployBootstrap.ps1
+        requireValidSignature = $true       # Require hash validation
+        enableVersionCheck = $true          # Check version before downloading
+        forceUpdate = $false               # Don't force update if version is same
+    }
 }

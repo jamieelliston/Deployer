@@ -28,4 +28,31 @@ return @{
         logPath = "X:\Deploy\Logs\Bootstrap"
         logLevel = "Info"
     }
+
+    # Bootstrap self-update configuration (optional)
+    # Supports: Azure Blob, HTTP/HTTPS, SMB/UNC, Local paths
+    bootstrapUpdate = @{
+        enabled = $false                    # Set to $true to enable automatic bootstrap updates
+
+        # Package URL - can be any of:
+        # - Azure Blob: https://storage.blob.core.windows.net/deploy/DeployBootstrap.zip
+        # - HTTP/HTTPS: https://updates.company.com/DeployBootstrap.zip
+        # - SMB/UNC: \\server\deployment\DeployBootstrap.zip
+        # - Local: C:\Updates\DeployBootstrap.zip
+        packageUrl = "https://mystorageaccount.blob.core.windows.net/deployment/DeployBootstrap.zip"
+
+        # Authentication type: "Anonymous", "SAS", or "None" (for SMB/Local)
+        authType = "Anonymous"
+
+        # SAS token (only required if authType = "SAS")
+        sasToken = $null
+
+        # Optional: Override auto-constructed URLs
+        # versionFileUrl = $null            # Auto: replaces .zip with -version.ps1
+        # hashFileUrl = $null               # Auto: replaces .zip with .ps1
+
+        requireValidSignature = $true       # Require hash validation before update
+        enableVersionCheck = $true          # Check version before downloading
+        forceUpdate = $false               # Download even if version is same/older
+    }
 }

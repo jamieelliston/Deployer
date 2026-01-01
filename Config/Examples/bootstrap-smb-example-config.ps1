@@ -29,4 +29,14 @@ return @{
         logPath = "X:\Deploy\Logs\Bootstrap"
         logLevel = "Info"
     }
+
+    # Bootstrap self-update configuration (optional)
+    bootstrapUpdate = @{
+        enabled = $false                    # Set to $true to enable automatic bootstrap updates
+        packageUrl = "\\\\fileserver\\deploymentshare\\Packages\\DeployBootstrap.zip"
+        authType = "None"                   # SMB uses Windows authentication
+        requireValidSignature = $true
+        enableVersionCheck = $true
+        forceUpdate = $false
+    }
 }

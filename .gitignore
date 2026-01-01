@@ -1,6 +1,7 @@
 # Windows image files
 *.wim
 *.iso
+*.esd
 
 # Build artifacts
 Build/
