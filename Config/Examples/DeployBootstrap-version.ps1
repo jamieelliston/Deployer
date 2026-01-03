@@ -7,25 +7,25 @@
 
 return @{
     # Semantic version string (Major.Minor.Patch)
-    version = "1.1.0"
+    version = "1.2.0"
 
     # Release date in ISO format
-    releaseDate = "2025-01-15"
+    releaseDate = "2026-01-03"
 
     # Minimum PowerShell version required
     minimumPSVersion = "5.1"
 
     # List of changes in this version
     changes = @(
-        "Add self-update capability with URL-agnostic download support"
-        "Fix path handling in test mode for C:\DeploymentTest"
-        "Improve error messages and logging"
-        "Add support for HTTP/HTTPS, SMB/UNC, and local file paths"
+        "Removed catalog-based validation (now using script signature validation only)"
+        "Simplified bootstrap update process by removing catalog download phase"
+        "Reduced bootstrap package size and download time"
+        "Improved architecture alignment with script signature validation approach"
     )
 
     # Flag indicating breaking changes
     breaking = $false
 
     # Optional: Additional metadata
-    releaseNotes = "https://github.com/yourorg/deployer/releases/tag/v1.1.0"
+    releaseNotes = "https://github.com/jamieelliston/Deployer/releases/tag/v1.2.0"
 }

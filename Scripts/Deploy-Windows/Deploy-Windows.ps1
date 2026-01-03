@@ -59,6 +59,9 @@ param(
 # Set script root
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# Deployment Script Version
+$DEPLOYMENT_VERSION = "1.0.0"
+
 #region Embedded Functions
 
 #region Utility Functions

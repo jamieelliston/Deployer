@@ -84,7 +84,7 @@ $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:TestMode = $TestMode.IsPresent
 
 # Bootstrap Script Version
-$BOOTSTRAP_VERSION = "1.0.0"
+$BOOTSTRAP_VERSION = "1.2.0"
 
 # Default to bootstrap-config.ps1 in script directory if not specified
 if (-not $ConfigPath) {
@@ -430,6 +430,48 @@ function Compare-SemanticVersion {
     return 0  # Equal
 }
 
+# Extract version string from PowerShell script file
+function Get-ScriptVersion {
+    <#
+    .SYNOPSIS
+        Extract BOOTSTRAP_VERSION from a PowerShell script file
+    .DESCRIPTION
+        Parses a .ps1 file to extract the $BOOTSTRAP_VERSION variable value without executing the script
+    .PARAMETER ScriptPath
+        Path to the .ps1 file to parse
+    .OUTPUTS
+        Version string (e.g., "1.3.0") or $null if not found
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath
+    )
+
+    try {
+        if (-not (Test-Path $ScriptPath)) {
+            Write-DeploymentLog "Script file not found: $ScriptPath" -Level Error
+            return $null
+        }
+
+        $content = Get-Content -Path $ScriptPath -Raw -ErrorAction Stop
+
+        # Match: $BOOTSTRAP_VERSION = "1.2.0" or $BOOTSTRAP_VERSION="1.2.0"
+        if ($content -match '\$BOOTSTRAP_VERSION\s*=\s*"([^"]+)"') {
+            $version = $matches[1]
+            Write-DeploymentLog "Extracted version: $version from $ScriptPath" -Level Verbose
+            return $version
+        }
+
+        Write-DeploymentLog "No BOOTSTRAP_VERSION variable found in script" -Level Warning
+        return $null
+    }
+    catch {
+        Write-DeploymentLog "Failed to read script file: $($_.Exception.Message)" -Level Error
+        return $null
+    }
+}
+
 # Check if a newer bootstrap version is available
 function Test-BootstrapUpdate {
     <#
@@ -439,8 +481,8 @@ function Test-BootstrapUpdate {
         Bootstrap configuration hashtable
     .PARAMETER CurrentVersion
         Current bootstrap version
-    .PARAMETER BootstrapUrl
-        URL to bootstrap package
+    .PARAMETER BootstrapScriptUrl
+        URL to bootstrap script (.ps1 file)
     .PARAMETER AuthType
         Authentication type
     .PARAMETER SasToken
@@ -457,7 +499,7 @@ function Test-BootstrapUpdate {
         [string]$CurrentVersion,
 
         [Parameter(Mandatory = $true)]
-        [string]$BootstrapUrl,
+        [string]$BootstrapScriptUrl,
 
         [Parameter(Mandatory = $false)]
         [string]$AuthType = "Anonymous",
@@ -470,22 +512,22 @@ function Test-BootstrapUpdate {
         UpdateAvailable = $false
         NewVersion = $null
         VersionFileUrl = $null
-        BootstrapZipUrl = $null
+        BootstrapScriptUrl = $null
         VersionMetadata = $null
     }
 
     Write-DeploymentLog "Checking for bootstrap updates..." -Level Info
     Write-DeploymentLog "  Current version: $CurrentVersion" -Level Info
-    Write-DeploymentLog "  Package URL: $BootstrapUrl" -Level Info
+    Write-DeploymentLog "  Script URL: $BootstrapScriptUrl" -Level Info
 
-    $result.BootstrapZipUrl = $BootstrapUrl
+    $result.BootstrapScriptUrl = $BootstrapScriptUrl
 
     # Determine version file location
     $versionFileUrl = if ($Config.bootstrapUpdate -and $Config.bootstrapUpdate.versionFileUrl) {
         $Config.bootstrapUpdate.versionFileUrl
     } else {
-        # Auto-construct: replace .zip with -version.ps1
-        $BootstrapUrl -replace '\.zip$', '-version.ps1'
+        # Auto-construct: replace .ps1 with -version.ps1
+        $BootstrapScriptUrl -replace '\.ps1$', '-version.ps1'
     }
 
     Write-DeploymentLog "  Version file: $versionFileUrl" -Level Verbose
@@ -551,13 +593,17 @@ function Test-BootstrapUpdate {
 function Update-Bootstrap {
     <#
     .SYNOPSIS
-        Download and apply bootstrap update
+        Download and apply bootstrap update (direct .ps1 download)
+    .DESCRIPTION
+        Downloads Deploy-Bootstrap.ps1 directly, validates version and signature, returns path if newer
     .PARAMETER Config
         Bootstrap configuration hashtable
     .PARAMETER UpdateInfo
         Update information from Test-BootstrapUpdate
+    .PARAMETER CurrentVersion
+        Current bootstrap version for comparison
     .OUTPUTS
-        Path to new bootstrap script, or $null if update failed
+        Path to new bootstrap script, or $null if update failed/not needed
     #>
     [CmdletBinding()]
     param(
@@ -565,11 +611,14 @@ function Update-Bootstrap {
         [hashtable]$Config,
 
         [Parameter(Mandatory = $true)]
-        [hashtable]$UpdateInfo
+        [hashtable]$UpdateInfo,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentVersion
     )
 
     Write-DeploymentLog "Downloading bootstrap update..." -Level Info
-    Write-DeploymentLog "  Version: $($UpdateInfo.NewVersion)" -Level Info
+    Write-DeploymentLog "  Target version: $($UpdateInfo.NewVersion)" -Level Info
 
     # Create temp directory for update
     $updateDir = Get-TemporaryPath -Prefix "BootstrapUpdate_"
@@ -577,8 +626,7 @@ function Update-Bootstrap {
         New-Item -Path $updateDir -ItemType Directory -Force | Out-Null
     }
 
-    $bootstrapZip = Join-Path $updateDir "DeployBootstrap.zip"
-    $catalogFile = Join-Path $updateDir "DeployBootstrap.cat"
+    $newScriptPath = Join-Path $updateDir "Deploy-Bootstrap.ps1"
 
     try {
         # Determine authentication method
@@ -590,139 +638,98 @@ function Update-Bootstrap {
 
         $sasToken = $Config.bootstrapUpdate.sasToken
 
-        # =====================================================================
-        # PHASE 1: Catalog Download and Signature Validation (BEFORE .zip)
-        # =====================================================================
+        # Download script directly
+        Write-DeploymentLog "Downloading bootstrap script..." -Level Info
+        Write-DeploymentLog "  Script URL: $($UpdateInfo.BootstrapScriptUrl)" -Level Verbose
 
-        Write-DeploymentLog "Preparing catalog validation..." -Level Info
+        $downloadSuccess = Get-BootstrapFile -Url $UpdateInfo.BootstrapScriptUrl -Destination $newScriptPath -AuthType $authType -SasToken $sasToken
 
-        # Derive catalog URL from package URL
-        $catalogFileUrl = $UpdateInfo.BootstrapZipUrl -replace '\.zip$', '.cat'
-
-        Write-DeploymentLog "Downloading catalog file..." -Level Info
-        Write-DeploymentLog "  Catalog URL: $catalogFileUrl" -Level Verbose
-
-        $catDownload = Get-BootstrapFile -Url $catalogFileUrl -Destination $catalogFile -AuthType $authType -SasToken $sasToken
-
-        if (-not $catDownload -or -not (Test-Path $catalogFile)) {
-            throw "Catalog file not found at: $catalogFileUrl. Catalog validation is required."
+        if (-not $downloadSuccess -or -not (Test-Path $newScriptPath)) {
+            Write-DeploymentLog "Failed to download bootstrap script" -Level Error
+            return $null
         }
 
-        Write-DeploymentLog "Catalog file downloaded" -Level Info
+        $scriptSize = [math]::Round((Get-Item $newScriptPath).Length / 1KB, 2)
+        Write-DeploymentLog "Bootstrap script downloaded: $scriptSize KB" -Level Info
 
-        # Validate catalog signature
+        # Extract and verify version from downloaded script
+        $downloadedVersion = Get-ScriptVersion -ScriptPath $newScriptPath
+
+        if (-not $downloadedVersion) {
+            Write-DeploymentLog "Cannot determine version of downloaded script - aborting update" -Level Error
+            return $null
+        }
+
+        Write-DeploymentLog "Downloaded script version: $downloadedVersion" -Level Info
+
+        # Compare versions
+        $versionComparison = Compare-SemanticVersion -Version1 $CurrentVersion -Version2 $downloadedVersion
+
+        if ($versionComparison -ge 0) {
+            # Current version is same or newer
+            Write-DeploymentLog "Downloaded version ($downloadedVersion) is not newer than current ($CurrentVersion) - skipping update" -Level Info
+            return $null
+        }
+
+        Write-DeploymentLog "Version confirmed: $downloadedVersion is newer than $CurrentVersion" -Level Info
+
+        # Validate signature if enabled
         if ($Config.validation.enableSignatureCheck) {
-            Write-DeploymentLog "Verifying catalog signature..." -Level Info
+            Write-DeploymentLog "Validating script signature..." -Level Info
 
-            $catalogSignature = Get-AuthenticodeSignature -FilePath $catalogFile -ErrorAction Stop
+            $signature = Get-AuthenticodeSignature -FilePath $newScriptPath -ErrorAction Stop
 
-            if ($catalogSignature.Status -ne "Valid") {
-                throw "Catalog signature invalid: $($catalogSignature.Status). Bootstrap package download aborted."
-            }
+            if ($signature.Status -ne "Valid") {
+                Write-DeploymentLog "Script signature invalid: $($signature.Status)" -Level Error
 
-            # Verify signer is in trusted publishers list
-            $signerCert = $catalogSignature.SignerCertificate
-            $isTrustedSigner = $false
-
-            foreach ($trustedPublisher in $Config.validation.trustedPublishers) {
-                if ($trustedPublisher -match '^Thumbprint:(.+)$') {
-                    $thumbprint = $matches[1]
-                    if ($signerCert.Thumbprint -eq $thumbprint) {
-                        $isTrustedSigner = $true
-                        Write-DeploymentLog "Catalog signed by trusted thumbprint: $thumbprint" -Level Verbose
-                        break
-                    }
+                if ($Config.validation.requireValidSignature) {
+                    Write-DeploymentLog "Valid signature required - aborting update" -Level Error
+                    return $null
                 }
-                elseif ($trustedPublisher -match '^CN:(.+)$') {
-                    $cnPattern = $matches[1]
-                    if ($signerCert.Subject -like "*CN=$cnPattern*") {
-                        $isTrustedSigner = $true
-                        Write-DeploymentLog "Catalog signed by trusted CN: $cnPattern" -Level Verbose
-                        break
-                    }
+                else {
+                    Write-DeploymentLog "Signature validation failed but not required - continuing" -Level Warning
                 }
             }
+            else {
+                # Check trusted publishers
+                $signerCert = $signature.SignerCertificate
+                $isTrusted = $false
 
-            if (-not $isTrustedSigner) {
-                throw "Catalog signer not in trusted publishers list. Bootstrap package download aborted.`n  Signer: $($signerCert.Subject)"
-            }
-
-            Write-DeploymentLog "Catalog signature validated successfully" -Level Info
-        }
-
-        Write-DeploymentLog "Catalog validated - proceeding with package download..." -Level Info
-
-        # =====================================================================
-        # PHASE 2: Package Download (AFTER catalog validation)
-        # =====================================================================
-
-        Write-DeploymentLog "Downloading bootstrap package..." -Level Info
-        Write-DeploymentLog "  Package URL: $($UpdateInfo.BootstrapZipUrl)" -Level Verbose
-
-        $downloadSuccess = Get-BootstrapFile -Url $UpdateInfo.BootstrapZipUrl -Destination $bootstrapZip -AuthType $authType -SasToken $sasToken
-
-        if (-not $downloadSuccess -or -not (Test-Path $bootstrapZip)) {
-            Write-DeploymentLog "Failed to download bootstrap update" -Level Error
-            return $null
-        }
-
-        Write-DeploymentLog "Bootstrap package downloaded: $([math]::Round((Get-Item $bootstrapZip).Length / 1MB, 2)) MB" -Level Info
-
-        # =====================================================================
-        # PHASE 3: Package Validation Against Catalog
-        # =====================================================================
-
-        Write-DeploymentLog "Validating bootstrap package against catalog..." -Level Info
-
-        $catalogResult = Test-FileCatalog -Path $bootstrapZip `
-                                         -CatalogFilePath $catalogFile `
-                                         -Detailed `
-                                         -ErrorAction Stop
-
-        if ($catalogResult.Status -ne "Valid") {
-            Write-DeploymentLog "Bootstrap package catalog validation FAILED: $($catalogResult.Status)" -Level Error
-
-            # Show validation details
-            if ($catalogResult.CatalogItems) {
-                foreach ($item in $catalogResult.CatalogItems) {
-                    if ($item.Status -ne "Valid") {
-                        Write-DeploymentLog "  Invalid: $($item.FileName) - $($item.Status)" -Level Error
+                foreach ($publisher in $Config.validation.trustedPublishers) {
+                    if ($publisher -match '^Thumbprint:(.+)$') {
+                        $thumbprint = $matches[1]
+                        if ($signerCert.Thumbprint -eq $thumbprint) {
+                            $isTrusted = $true
+                            Write-DeploymentLog "Script signed by trusted thumbprint: $thumbprint" -Level Verbose
+                            break
+                        }
+                    }
+                    elseif ($publisher -match '^CN:(.+)$') {
+                        $cnPattern = $matches[1]
+                        if ($signerCert.Subject -like "*CN=$cnPattern*") {
+                            $isTrusted = $true
+                            Write-DeploymentLog "Script signed by trusted CN: $cnPattern" -Level Verbose
+                            break
+                        }
                     }
                 }
+
+                if (-not $isTrusted) {
+                    Write-DeploymentLog "Script signed by untrusted publisher: $($signerCert.Subject)" -Level Error
+
+                    if ($Config.validation.requireValidSignature) {
+                        Write-DeploymentLog "Trusted publisher required - aborting update" -Level Error
+                        return $null
+                    }
+                }
+                else {
+                    Write-DeploymentLog "Script signature validated successfully" -Level Info
+                }
             }
-
-            throw "Bootstrap package validation against catalog FAILED"
         }
 
-        Write-DeploymentLog "Bootstrap package catalog validation PASSED" -Level Info
-
-        # Cleanup catalog file
-        if (Test-Path $catalogFile) {
-            Remove-Item $catalogFile -Force -ErrorAction SilentlyContinue
-        }
-
-        # Extract bootstrap package
-        Write-DeploymentLog "Extracting bootstrap update..." -Level Info
-        $extractPath = Join-Path $updateDir "Extracted"
-
-        try {
-            Expand-Archive -Path $bootstrapZip -DestinationPath $extractPath -Force
-        }
-        catch {
-            Write-DeploymentLog "Failed to extract bootstrap package: $($_.Exception.Message)" -Level Error
-            return $null
-        }
-
-        # Find new Deploy-Bootstrap.ps1
-        $newBootstrapScript = Get-ChildItem -Path $extractPath -Filter "Deploy-Bootstrap.ps1" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-
-        if (-not $newBootstrapScript) {
-            Write-DeploymentLog "Deploy-Bootstrap.ps1 not found in update package" -Level Error
-            return $null
-        }
-
-        Write-DeploymentLog "Bootstrap update extracted successfully" -Level Info
-        return $newBootstrapScript.FullName
+        Write-DeploymentLog "Bootstrap update ready: $newScriptPath" -Level Info
+        return $newScriptPath
     }
     catch {
         Write-DeploymentLog "Bootstrap update failed: $($_.Exception.Message)" -Level Error
@@ -1965,24 +1972,24 @@ try {
     Write-DeploymentLog "===== BOOTSTRAP UPDATE CHECK =====" -Level Info
 
     # Auto-discover update location
-    $bootstrapUrl = $null
+    $bootstrapScriptUrl = $null
 
-    # 1. Check config for explicit packageUrl
-    if ($config.bootstrapUpdate -and $config.bootstrapUpdate.packageUrl) {
-        $bootstrapUrl = $config.bootstrapUpdate.packageUrl
-        Write-DeploymentLog "Using configured bootstrap URL: $bootstrapUrl" -Level Verbose
+    # 1. Check config for explicit scriptUrl
+    if ($config.bootstrapUpdate -and $config.bootstrapUpdate.scriptUrl) {
+        $bootstrapScriptUrl = $config.bootstrapUpdate.scriptUrl
+        Write-DeploymentLog "Using configured bootstrap URL: $bootstrapScriptUrl" -Level Verbose
     }
     # 2. Auto-derive from packageSource
     elseif ($config.packageSource.blobUrl) {
-        $bootstrapUrl = $config.packageSource.blobUrl -replace 'DeploymentPackage\.zip$', 'DeployBootstrap.zip'
-        Write-DeploymentLog "Auto-derived bootstrap URL: $bootstrapUrl" -Level Verbose
+        $bootstrapScriptUrl = $config.packageSource.blobUrl -replace 'DeploymentPackage\.zip$', 'Deploy-Bootstrap.ps1'
+        Write-DeploymentLog "Auto-derived bootstrap URL: $bootstrapScriptUrl" -Level Verbose
     }
     elseif ($config.packageSource.uncPath) {
-        $bootstrapUrl = $config.packageSource.uncPath -replace 'DeploymentPackage\.zip$', 'DeployBootstrap.zip'
-        Write-DeploymentLog "Auto-derived bootstrap URL: $bootstrapUrl" -Level Verbose
+        $bootstrapScriptUrl = $config.packageSource.uncPath -replace 'DeploymentPackage\.zip$', 'Deploy-Bootstrap.ps1'
+        Write-DeploymentLog "Auto-derived bootstrap URL: $bootstrapScriptUrl" -Level Verbose
     }
 
-    if ($bootstrapUrl) {
+    if ($bootstrapScriptUrl) {
         # Determine auth type
         $updateAuthType = if ($config.bootstrapUpdate -and $config.bootstrapUpdate.authType) {
             $config.bootstrapUpdate.authType
@@ -2003,7 +2010,7 @@ try {
 
         # Attempt update check (non-fatal if fails)
         try {
-            $updateInfo = Test-BootstrapUpdate -Config $config -CurrentVersion $BOOTSTRAP_VERSION -BootstrapUrl $bootstrapUrl -AuthType $updateAuthType -SasToken $updateSasToken
+            $updateInfo = Test-BootstrapUpdate -Config $config -CurrentVersion $BOOTSTRAP_VERSION -BootstrapScriptUrl $bootstrapScriptUrl -AuthType $updateAuthType -SasToken $updateSasToken
 
             if ($updateInfo.UpdateAvailable) {
                 Write-Host ""
@@ -2016,7 +2023,7 @@ try {
                 Write-Host ""
 
                 # Download and apply update
-                $newBootstrapScript = Update-Bootstrap -Config $config -UpdateInfo $updateInfo
+                $newBootstrapScript = Update-Bootstrap -Config $config -UpdateInfo $updateInfo -CurrentVersion $BOOTSTRAP_VERSION
 
                 if ($newBootstrapScript) {
                     Write-Host "Bootstrap updated successfully!" -ForegroundColor Green
@@ -2092,113 +2099,9 @@ try {
     $DeploymentState.TempPaths += $tempDir
 
     $packageFile = Join-Path $tempDir "deployment-package.zip"
-    $catalogFile = Join-Path $tempDir "deployment-package.cat"
 
     # =====================================================================
-    # PHASE 1: Catalog Download and Signature Validation (BEFORE package)
-    # =====================================================================
-
-    Write-DeploymentLog "Preparing catalog validation..." -Level Info
-
-    # Derive catalog URL from package URL
-    $catalogUrl = $packageSource -replace '\.zip$', '.cat'
-
-    Write-DeploymentLog "Downloading catalog file..." -Level Info
-    Write-DeploymentLog "  Catalog URL: $catalogUrl" -Level Verbose
-
-    # Download catalog based on auth type
-    try {
-        if ($authType -eq "SAS") {
-            $catalogSasToken = if ($config.packageSource.catalogSasToken) {
-                $config.packageSource.catalogSasToken
-            } else {
-                $config.packageSource.sasToken
-            }
-            Get-AzureBlobWithSAS -BlobUrl $catalogUrl -SasToken $catalogSasToken -Destination $catalogFile -ShowProgress:$false
-        }
-        elseif ($authType -eq "Anonymous") {
-            Get-AzureBlobAnonymous -BlobUrl $catalogUrl -Destination $catalogFile -ShowProgress:$false
-        }
-        elseif ($authType -eq "SMB") {
-            $securePassword = $null
-            if ($config.packageSource.password) {
-                $securePassword = ConvertTo-SecureString -String $config.packageSource.password -AsPlainText -Force
-            }
-
-            if ($config.packageSource.username -and $securePassword) {
-                Get-SMBFile -UncPath $catalogUrl -Destination $catalogFile -Username $config.packageSource.username -Password $securePassword -ShowProgress:$false
-            }
-            else {
-                Get-SMBFile -UncPath $catalogUrl -Destination $catalogFile -ShowProgress:$false
-            }
-        }
-        else {
-            # Auto-detect
-            if ($catalogUrl -match '^\\\\') {
-                Get-SMBFile -UncPath $catalogUrl -Destination $catalogFile -ShowProgress:$false
-            }
-            elseif ($catalogUrl -match '^https?://') {
-                Get-AzureBlobAnonymous -BlobUrl $catalogUrl -Destination $catalogFile -ShowProgress:$false
-            }
-            else {
-                Copy-Item -Path $catalogUrl -Destination $catalogFile -Force
-            }
-        }
-    }
-    catch {
-        throw "Failed to download catalog file: $($_.Exception.Message)"
-    }
-
-    if (-not (Test-Path $catalogFile)) {
-        throw "Catalog file not found at: $catalogUrl. Catalog validation is required."
-    }
-
-    Write-DeploymentLog "Catalog file downloaded" -Level Info
-
-    # Validate catalog signature
-    if ($config.validation.enableSignatureCheck) {
-        Write-DeploymentLog "Verifying catalog file signature..." -Level Info
-
-        $catalogSignature = Get-AuthenticodeSignature -FilePath $catalogFile -ErrorAction Stop
-
-        if ($catalogSignature.Status -ne "Valid") {
-            throw "Catalog signature invalid: $($catalogSignature.Status). Package download aborted."
-        }
-
-        # Verify signer is in trusted publishers list
-        $signerCert = $catalogSignature.SignerCertificate
-        $isTrustedSigner = $false
-
-        foreach ($trustedPublisher in $config.validation.trustedPublishers) {
-            if ($trustedPublisher -match '^Thumbprint:(.+)$') {
-                $thumbprint = $matches[1]
-                if ($signerCert.Thumbprint -eq $thumbprint) {
-                    $isTrustedSigner = $true
-                    Write-DeploymentLog "Catalog signed by trusted thumbprint: $thumbprint" -Level Verbose
-                    break
-                }
-            }
-            elseif ($trustedPublisher -match '^CN:(.+)$') {
-                $cnPattern = $matches[1]
-                if ($signerCert.Subject -like "*CN=$cnPattern*") {
-                    $isTrustedSigner = $true
-                    Write-DeploymentLog "Catalog signed by trusted CN: $cnPattern" -Level Verbose
-                    break
-                }
-            }
-        }
-
-        if (-not $isTrustedSigner) {
-            throw "Catalog signer not in trusted publishers list. Package download aborted.`n  Signer: $($signerCert.Subject)"
-        }
-
-        Write-DeploymentLog "Catalog signature validated successfully" -Level Info
-    }
-
-    Write-DeploymentLog "Catalog validated - proceeding with package download..." -Level Info
-
-    # =====================================================================
-    # PHASE 2: Package Download (AFTER catalog validation)
+    # Package Download
     # =====================================================================
 
     Write-DeploymentLog "Acquiring deployment package..." -Level Info
@@ -2245,40 +2148,6 @@ try {
     }
 
     Write-DeploymentLog "Package acquired successfully: $packageFile" -Level Info
-
-    # =====================================================================
-    # PHASE 3: Package Validation Against Catalog
-    # =====================================================================
-
-    Write-DeploymentLog "Validating package against catalog..." -Level Info
-
-    $catalogResult = Test-FileCatalog -Path $packageFile `
-                                     -CatalogFilePath $catalogFile `
-                                     -Detailed `
-                                     -ErrorAction Stop
-
-    if ($catalogResult.Status -ne "Valid") {
-        Write-DeploymentLog "Package catalog validation FAILED: $($catalogResult.Status)" -Level Error
-
-        # Show validation details
-        if ($catalogResult.CatalogItems) {
-            foreach ($item in $catalogResult.CatalogItems) {
-                if ($item.Status -ne "Valid") {
-                    Write-DeploymentLog "  Invalid: $($item.FileName) - $($item.Status)" -Level Error
-                }
-            }
-        }
-
-        throw "Package validation against catalog FAILED"
-    }
-
-    Write-DeploymentLog "Package catalog validation PASSED" -Level Info
-
-    # Cleanup catalog file
-    if (Test-Path $catalogFile) {
-        Remove-Item $catalogFile -Force -ErrorAction SilentlyContinue
-    }
-    #endregion
 
     #region Signature Validation
     $validatedExtraction = $null
