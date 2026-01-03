@@ -19,12 +19,16 @@ return @{
         edition = "Windows 11 Pro"
     }
 
-    # Optional: Image validation using catalog files (Test-FileCatalog)
+    # Image validation using catalog files (catalog-first approach)
+    # Validation flow:
+    # 1. Download .cat file and validate signature (BEFORE downloading image)
+    # 2. If signature invalid or untrusted, deployment fails immediately
+    # 3. Download image file (AFTER catalog validated)
+    # 4. Validate image against catalog using Test-FileCatalog
     imageValidation = @{
         enabled = $true
         # catalogUrl is optional - auto-discovered by replacing .iso/.wim/.ffu with .cat
         # catalogUrl = "https://mystorageaccount.blob.core.windows.net/images/Win11_23H2_Pro.cat"
-        requireValidCatalog = $false  # Set to $true to fail deployment if catalog validation fails
         enableSignatureCheck = $true  # Verify catalog file signature
         trustedPublishers = @(
             "CN:Contoso Corporation"          # Certificate subject CN contains match

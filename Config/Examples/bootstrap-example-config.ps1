@@ -1,17 +1,20 @@
 # Bootstrap configuration example
 # Downloads and validates deployment package from Azure Blob
 #
-# Validation chain (in order):
-# 1. Catalog validation (if .cat file found) - Uses Test-FileCatalog
-# 2. Package hash validation (fallback if catalog not available)
-# 3. Deploy-Windows.ps1 script signature validation
+# Validation chain (catalog-first approach):
+# 1. Download .cat file and validate signature (BEFORE downloading .zip)
+# 2. If signature invalid or untrusted, deployment fails immediately
+# 3. Download .zip package (AFTER catalog validated)
+# 4. Validate package against catalog using Test-FileCatalog
+# 5. Validate Deploy-Windows.ps1 script signature
 #
 # This configuration file can be signed with Authenticode signatures
 
 return @{
     packageSource = @{
         blobUrl = "https://mystorageaccount.blob.core.windows.net/deployment/DeploymentPackage.zip"
-        packageHashUrl = "https://mystorageaccount.blob.core.windows.net/deployment/deployment-package-hash.ps1"
+        # Catalog file (.cat) is auto-discovered by replacing .zip with .cat
+        # Package validation now uses catalog-only approach (no hash files)
         authType = "Anonymous"
     }
 
@@ -53,9 +56,9 @@ return @{
 
         # Optional: Override auto-constructed URLs
         # versionFileUrl = $null            # Auto: replaces .zip with -version.ps1
-        # hashFileUrl = $null               # Auto: replaces .zip with .ps1
+        # Catalog file (.cat) is auto-discovered by replacing .zip with .cat
 
-        requireValidSignature = $true       # Require hash validation before update
+        requireValidSignature = $true       # Require catalog validation before update
         enableVersionCheck = $true          # Check version before downloading
         forceUpdate = $false               # Download even if version is same/older
     }

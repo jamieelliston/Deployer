@@ -578,9 +578,10 @@ function Update-Bootstrap {
     }
 
     $bootstrapZip = Join-Path $updateDir "DeployBootstrap.zip"
+    $catalogFile = Join-Path $updateDir "DeployBootstrap.cat"
 
     try {
-        # Download bootstrap package using universal helper
+        # Determine authentication method
         $authType = if ($Config.bootstrapUpdate.authType) {
             $Config.bootstrapUpdate.authType
         } else {
@@ -588,6 +589,75 @@ function Update-Bootstrap {
         }
 
         $sasToken = $Config.bootstrapUpdate.sasToken
+
+        # =====================================================================
+        # PHASE 1: Catalog Download and Signature Validation (BEFORE .zip)
+        # =====================================================================
+
+        Write-DeploymentLog "Preparing catalog validation..." -Level Info
+
+        # Derive catalog URL from package URL
+        $catalogFileUrl = $UpdateInfo.BootstrapZipUrl -replace '\.zip$', '.cat'
+
+        Write-DeploymentLog "Downloading catalog file..." -Level Info
+        Write-DeploymentLog "  Catalog URL: $catalogFileUrl" -Level Verbose
+
+        $catDownload = Get-BootstrapFile -Url $catalogFileUrl -Destination $catalogFile -AuthType $authType -SasToken $sasToken
+
+        if (-not $catDownload -or -not (Test-Path $catalogFile)) {
+            throw "Catalog file not found at: $catalogFileUrl. Catalog validation is required."
+        }
+
+        Write-DeploymentLog "Catalog file downloaded" -Level Info
+
+        # Validate catalog signature
+        if ($Config.validation.enableSignatureCheck) {
+            Write-DeploymentLog "Verifying catalog signature..." -Level Info
+
+            $catalogSignature = Get-AuthenticodeSignature -FilePath $catalogFile -ErrorAction Stop
+
+            if ($catalogSignature.Status -ne "Valid") {
+                throw "Catalog signature invalid: $($catalogSignature.Status). Bootstrap package download aborted."
+            }
+
+            # Verify signer is in trusted publishers list
+            $signerCert = $catalogSignature.SignerCertificate
+            $isTrustedSigner = $false
+
+            foreach ($trustedPublisher in $Config.validation.trustedPublishers) {
+                if ($trustedPublisher -match '^Thumbprint:(.+)$') {
+                    $thumbprint = $matches[1]
+                    if ($signerCert.Thumbprint -eq $thumbprint) {
+                        $isTrustedSigner = $true
+                        Write-DeploymentLog "Catalog signed by trusted thumbprint: $thumbprint" -Level Verbose
+                        break
+                    }
+                }
+                elseif ($trustedPublisher -match '^CN:(.+)$') {
+                    $cnPattern = $matches[1]
+                    if ($signerCert.Subject -like "*CN=$cnPattern*") {
+                        $isTrustedSigner = $true
+                        Write-DeploymentLog "Catalog signed by trusted CN: $cnPattern" -Level Verbose
+                        break
+                    }
+                }
+            }
+
+            if (-not $isTrustedSigner) {
+                throw "Catalog signer not in trusted publishers list. Bootstrap package download aborted.`n  Signer: $($signerCert.Subject)"
+            }
+
+            Write-DeploymentLog "Catalog signature validated successfully" -Level Info
+        }
+
+        Write-DeploymentLog "Catalog validated - proceeding with package download..." -Level Info
+
+        # =====================================================================
+        # PHASE 2: Package Download (AFTER catalog validation)
+        # =====================================================================
+
+        Write-DeploymentLog "Downloading bootstrap package..." -Level Info
+        Write-DeploymentLog "  Package URL: $($UpdateInfo.BootstrapZipUrl)" -Level Verbose
 
         $downloadSuccess = Get-BootstrapFile -Url $UpdateInfo.BootstrapZipUrl -Destination $bootstrapZip -AuthType $authType -SasToken $sasToken
 
@@ -598,150 +668,37 @@ function Update-Bootstrap {
 
         Write-DeploymentLog "Bootstrap package downloaded: $([math]::Round((Get-Item $bootstrapZip).Length / 1MB, 2)) MB" -Level Info
 
-        # Look for catalog file (.cat) for signature validation
-        $catalogFileUrl = $UpdateInfo.BootstrapZipUrl -replace '\.zip$', '.cat'
-        $catalogFile = Join-Path $updateDir "DeployBootstrap.cat"
+        # =====================================================================
+        # PHASE 3: Package Validation Against Catalog
+        # =====================================================================
 
-        $hasCatalogFile = $false
-        try {
-            Write-DeploymentLog "Looking for catalog file: $catalogFileUrl" -Level Verbose
-            $catDownload = Get-BootstrapFile -Url $catalogFileUrl -Destination $catalogFile -AuthType $authType -SasToken $sasToken
+        Write-DeploymentLog "Validating bootstrap package against catalog..." -Level Info
 
-            if ($catDownload -and (Test-Path $catalogFile)) {
-                Write-DeploymentLog "Catalog file found" -Level Info
-                $hasCatalogFile = $true
-            }
-        }
-        catch {
-            Write-DeploymentLog "Catalog file not found (optional): $($_.Exception.Message)" -Level Verbose
-        }
+        $catalogResult = Test-FileCatalog -Path $bootstrapZip `
+                                         -CatalogFilePath $catalogFile `
+                                         -Detailed `
+                                         -ErrorAction Stop
 
-        # Validate package
-        $hashValidationRequired = $true
+        if ($catalogResult.Status -ne "Valid") {
+            Write-DeploymentLog "Bootstrap package catalog validation FAILED: $($catalogResult.Status)" -Level Error
 
-        if ($hasCatalogFile) {
-            Write-DeploymentLog "Validating bootstrap package using catalog file..." -Level Info
-
-            try {
-                # Validate catalog signature if signature checking enabled
-                if ($Config.validation.enableSignatureCheck) {
-                    Write-DeploymentLog "Verifying catalog file signature..." -Level Verbose
-
-                    $catalogSignature = Get-AuthenticodeSignature -FilePath $catalogFile -ErrorAction Stop
-
-                    if ($catalogSignature.Status -ne "Valid") {
-                        Write-DeploymentLog "Catalog signature invalid: $($catalogSignature.Status)" -Level Warning
-                        Write-DeploymentLog "Falling back to hash file validation" -Level Info
-                        $hasCatalogFile = $false
-                    }
-                    else {
-                        # Verify signer is trusted
-                        $signerCert = $catalogSignature.SignerCertificate
-                        $isTrustedSigner = $false
-
-                        foreach ($trustedPublisher in $Config.validation.trustedPublishers) {
-                            if ($trustedPublisher -match '^Thumbprint:(.+)$') {
-                                $thumbprint = $matches[1]
-                                if ($signerCert.Thumbprint -eq $thumbprint) {
-                                    $isTrustedSigner = $true
-                                    Write-DeploymentLog "Catalog signed by trusted thumbprint: $thumbprint" -Level Verbose
-                                    break
-                                }
-                            }
-                            elseif ($trustedPublisher -match '^CN:(.+)$') {
-                                $cnPattern = $matches[1]
-                                if ($signerCert.Subject -like "*CN=$cnPattern*") {
-                                    $isTrustedSigner = $true
-                                    Write-DeploymentLog "Catalog signed by trusted CN: $cnPattern" -Level Verbose
-                                    break
-                                }
-                            }
-                        }
-
-                        if (-not $isTrustedSigner) {
-                            Write-DeploymentLog "Catalog signer not in trusted publishers list" -Level Warning
-                            Write-DeploymentLog "  Signer: $($signerCert.Subject)" -Level Warning
-                            Write-DeploymentLog "Falling back to hash file validation" -Level Info
-                            $hasCatalogFile = $false
-                        }
-                    }
-                }
-
-                # Perform catalog validation if signature valid (or signature check disabled)
-                if ($hasCatalogFile) {
-                    Write-DeploymentLog "Running Test-FileCatalog validation..." -Level Verbose
-
-                    $catalogResult = Test-FileCatalog -Path $bootstrapZip `
-                                                     -CatalogFilePath $catalogFile `
-                                                     -Detailed `
-                                                     -ErrorAction Stop
-
-                    if ($catalogResult.Status -eq "Valid") {
-                        Write-DeploymentLog "Bootstrap package catalog validation PASSED" -Level Info
-                        $hashValidationRequired = $false  # Skip hash validation
-                    }
-                    else {
-                        Write-DeploymentLog "Catalog validation FAILED: $($catalogResult.Status)" -Level Warning
-
-                        # Show validation details
-                        if ($catalogResult.CatalogItems) {
-                            foreach ($item in $catalogResult.CatalogItems) {
-                                if ($item.Status -ne "Valid") {
-                                    Write-DeploymentLog "  Invalid: $($item.FileName) - $($item.Status)" -Level Warning
-                                }
-                            }
-                        }
-
-                        Write-DeploymentLog "Falling back to hash file validation" -Level Info
-                        $hasCatalogFile = $false
+            # Show validation details
+            if ($catalogResult.CatalogItems) {
+                foreach ($item in $catalogResult.CatalogItems) {
+                    if ($item.Status -ne "Valid") {
+                        Write-DeploymentLog "  Invalid: $($item.FileName) - $($item.Status)" -Level Error
                     }
                 }
             }
-            catch {
-                Write-DeploymentLog "Catalog validation error: $($_.Exception.Message)" -Level Warning
-                Write-DeploymentLog "Falling back to hash file validation" -Level Info
-                $hasCatalogFile = $false
-            }
+
+            throw "Bootstrap package validation against catalog FAILED"
         }
 
-        if ((-not $hasCatalogFile -or $hashValidationRequired) -and ($Config.bootstrapUpdate.requireValidSignature -or $Config.validation.enableSignatureCheck)) {
-            # Fall back to hash file validation
-            Write-DeploymentLog "Validating bootstrap package with hash file..." -Level Info
+        Write-DeploymentLog "Bootstrap package catalog validation PASSED" -Level Info
 
-            # Download hash file
-            $hashFileUrl = if ($Config.bootstrapUpdate -and $Config.bootstrapUpdate.hashFileUrl) {
-                $Config.bootstrapUpdate.hashFileUrl
-            } else {
-                $UpdateInfo.BootstrapZipUrl -replace '\.zip$', '.ps1'
-            }
-
-            $hashFile = Join-Path $updateDir "DeployBootstrap.ps1"
-
-            try {
-                # Download hash file using universal helper
-                $hashDownloadSuccess = Get-BootstrapFile -Url $hashFileUrl -Destination $hashFile -AuthType $authType -SasToken $sasToken
-
-                if ($hashDownloadSuccess -and (Test-Path $hashFile)) {
-                    # Load expected hash
-                    $expectedHashInfo = & $hashFile
-
-                    # Calculate actual hash
-                    $actualHash = Get-FileHash -Path $bootstrapZip -Algorithm $expectedHashInfo.algorithm
-
-                    if ($actualHash.Hash -ne $expectedHashInfo.hash) {
-                        throw "Bootstrap package hash mismatch! Expected: $($expectedHashInfo.hash), Actual: $($actualHash.Hash)"
-                    }
-
-                    Write-DeploymentLog "Bootstrap package hash validated" -Level Info
-                }
-                else {
-                    Write-DeploymentLog "Hash file not found - skipping validation" -Level Warning
-                }
-            }
-            catch {
-                Write-DeploymentLog "Hash validation failed: $($_.Exception.Message)" -Level Error
-                return $null
-            }
+        # Cleanup catalog file
+        if (Test-Path $catalogFile) {
+            Remove-Item $catalogFile -Force -ErrorAction SilentlyContinue
         }
 
         # Extract bootstrap package
@@ -1559,6 +1516,23 @@ function Get-AzureBlobAnonymous {
             New-Item -Path $destDir -ItemType Directory -Force | Out-Null
         }
 
+        # Detect GitHub raw URLs and force simple download (BITS/WebClient incompatible)
+        if ($BlobUrl -match 'raw\.githubusercontent\.com|github\.com/.*/(raw|blob)/') {
+            Write-DeploymentLog "Detected GitHub URL - using Invoke-WebRequest for compatibility" -Level Verbose
+            Invoke-WebRequest -Uri $BlobUrl -OutFile $Destination -UseBasicParsing -ErrorAction Stop
+
+            # Verify download
+            if (Test-Path $Destination) {
+                $fileSize = (Get-Item $Destination).Length
+                Write-DeploymentLog "Download complete: $Destination ($([math]::Round($fileSize / 1MB, 2)) MB)" -Level Info
+                return $true
+            }
+            else {
+                Write-DeploymentLog "ERROR: File not created after download" -Level Error
+                return $false
+            }
+        }
+
         # Download with progress if requested
         if ($ShowProgress) {
             # Use BITS if available (faster for large files)
@@ -2118,9 +2092,117 @@ try {
     $DeploymentState.TempPaths += $tempDir
 
     $packageFile = Join-Path $tempDir "deployment-package.zip"
+    $catalogFile = Join-Path $tempDir "deployment-package.cat"
 
-    # Download or copy package
+    # =====================================================================
+    # PHASE 1: Catalog Download and Signature Validation (BEFORE package)
+    # =====================================================================
+
+    Write-DeploymentLog "Preparing catalog validation..." -Level Info
+
+    # Derive catalog URL from package URL
+    $catalogUrl = $packageSource -replace '\.zip$', '.cat'
+
+    Write-DeploymentLog "Downloading catalog file..." -Level Info
+    Write-DeploymentLog "  Catalog URL: $catalogUrl" -Level Verbose
+
+    # Download catalog based on auth type
+    try {
+        if ($authType -eq "SAS") {
+            $catalogSasToken = if ($config.packageSource.catalogSasToken) {
+                $config.packageSource.catalogSasToken
+            } else {
+                $config.packageSource.sasToken
+            }
+            Get-AzureBlobWithSAS -BlobUrl $catalogUrl -SasToken $catalogSasToken -Destination $catalogFile -ShowProgress:$false
+        }
+        elseif ($authType -eq "Anonymous") {
+            Get-AzureBlobAnonymous -BlobUrl $catalogUrl -Destination $catalogFile -ShowProgress:$false
+        }
+        elseif ($authType -eq "SMB") {
+            $securePassword = $null
+            if ($config.packageSource.password) {
+                $securePassword = ConvertTo-SecureString -String $config.packageSource.password -AsPlainText -Force
+            }
+
+            if ($config.packageSource.username -and $securePassword) {
+                Get-SMBFile -UncPath $catalogUrl -Destination $catalogFile -Username $config.packageSource.username -Password $securePassword -ShowProgress:$false
+            }
+            else {
+                Get-SMBFile -UncPath $catalogUrl -Destination $catalogFile -ShowProgress:$false
+            }
+        }
+        else {
+            # Auto-detect
+            if ($catalogUrl -match '^\\\\') {
+                Get-SMBFile -UncPath $catalogUrl -Destination $catalogFile -ShowProgress:$false
+            }
+            elseif ($catalogUrl -match '^https?://') {
+                Get-AzureBlobAnonymous -BlobUrl $catalogUrl -Destination $catalogFile -ShowProgress:$false
+            }
+            else {
+                Copy-Item -Path $catalogUrl -Destination $catalogFile -Force
+            }
+        }
+    }
+    catch {
+        throw "Failed to download catalog file: $($_.Exception.Message)"
+    }
+
+    if (-not (Test-Path $catalogFile)) {
+        throw "Catalog file not found at: $catalogUrl. Catalog validation is required."
+    }
+
+    Write-DeploymentLog "Catalog file downloaded" -Level Info
+
+    # Validate catalog signature
+    if ($config.validation.enableSignatureCheck) {
+        Write-DeploymentLog "Verifying catalog file signature..." -Level Info
+
+        $catalogSignature = Get-AuthenticodeSignature -FilePath $catalogFile -ErrorAction Stop
+
+        if ($catalogSignature.Status -ne "Valid") {
+            throw "Catalog signature invalid: $($catalogSignature.Status). Package download aborted."
+        }
+
+        # Verify signer is in trusted publishers list
+        $signerCert = $catalogSignature.SignerCertificate
+        $isTrustedSigner = $false
+
+        foreach ($trustedPublisher in $config.validation.trustedPublishers) {
+            if ($trustedPublisher -match '^Thumbprint:(.+)$') {
+                $thumbprint = $matches[1]
+                if ($signerCert.Thumbprint -eq $thumbprint) {
+                    $isTrustedSigner = $true
+                    Write-DeploymentLog "Catalog signed by trusted thumbprint: $thumbprint" -Level Verbose
+                    break
+                }
+            }
+            elseif ($trustedPublisher -match '^CN:(.+)$') {
+                $cnPattern = $matches[1]
+                if ($signerCert.Subject -like "*CN=$cnPattern*") {
+                    $isTrustedSigner = $true
+                    Write-DeploymentLog "Catalog signed by trusted CN: $cnPattern" -Level Verbose
+                    break
+                }
+            }
+        }
+
+        if (-not $isTrustedSigner) {
+            throw "Catalog signer not in trusted publishers list. Package download aborted.`n  Signer: $($signerCert.Subject)"
+        }
+
+        Write-DeploymentLog "Catalog signature validated successfully" -Level Info
+    }
+
+    Write-DeploymentLog "Catalog validated - proceeding with package download..." -Level Info
+
+    # =====================================================================
+    # PHASE 2: Package Download (AFTER catalog validation)
+    # =====================================================================
+
     Write-DeploymentLog "Acquiring deployment package..." -Level Info
+    Write-DeploymentLog "  Package URL: $packageSource" -Level Verbose
 
     if ($authType -eq "SAS") {
         if (-not $config.packageSource.sasToken) {
@@ -2129,7 +2211,7 @@ try {
         Get-AzureBlobWithSAS -BlobUrl $packageSource -SasToken $config.packageSource.sasToken -Destination $packageFile -ShowProgress
     }
     elseif ($authType -eq "Anonymous") {
-        Get-AzureBlobAnonymous -BlobUrl $packageSource -Destination $packageFile -ShowProgress
+        Get-AzureBlobAnonymous -BlobUrl $packageSource -Destination $packageFile -ShowProgress:$false
     }
     elseif ($authType -eq "SMB") {
         # Convert password to SecureString if provided
@@ -2163,234 +2245,38 @@ try {
     }
 
     Write-DeploymentLog "Package acquired successfully: $packageFile" -Level Info
-    #endregion
 
-    #region Package Hash Validation
-    # Auto-discover hash file URL if not explicitly specified
-    $hashUrl = $config.packageSource.packageHashUrl
-    $hashUrlExplicit = $true
+    # =====================================================================
+    # PHASE 3: Package Validation Against Catalog
+    # =====================================================================
 
-    if (-not $hashUrl) {
-        # Auto-construct hash URL by replacing .zip with .ps1
-        $hashUrl = $packageSource -replace '\.zip$', '.ps1'
-        $hashUrlExplicit = $false
-        Write-DeploymentLog "packageHashUrl not specified - auto-discovering: $hashUrl" -Level Verbose
+    Write-DeploymentLog "Validating package against catalog..." -Level Info
+
+    $catalogResult = Test-FileCatalog -Path $packageFile `
+                                     -CatalogFilePath $catalogFile `
+                                     -Detailed `
+                                     -ErrorAction Stop
+
+    if ($catalogResult.Status -ne "Valid") {
+        Write-DeploymentLog "Package catalog validation FAILED: $($catalogResult.Status)" -Level Error
+
+        # Show validation details
+        if ($catalogResult.CatalogItems) {
+            foreach ($item in $catalogResult.CatalogItems) {
+                if ($item.Status -ne "Valid") {
+                    Write-DeploymentLog "  Invalid: $($item.FileName) - $($item.Status)" -Level Error
+                }
+            }
+        }
+
+        throw "Package validation against catalog FAILED"
     }
 
-    if ($hashUrl) {
-        Write-DeploymentLog "===== PACKAGE HASH VALIDATION PHASE =====" -Level Info
-        if ($hashUrlExplicit) {
-            Write-DeploymentLog "Package hash validation enabled (explicit packageHashUrl)" -Level Info
-        }
-        else {
-            Write-DeploymentLog "Attempting package hash validation (auto-discovered)" -Level Info
-        }
+    Write-DeploymentLog "Package catalog validation PASSED" -Level Info
 
-        # Determine hash file name
-        $hashFileName = if ($hashUrl -match '([^/\\]+\.ps1)$') { $matches[1] } else { "package-hash.ps1" }
-        $hashFile = Join-Path $tempDir $hashFileName
-
-        Write-DeploymentLog "Downloading package hash file..." -Level Info
-        Write-DeploymentLog "  Hash URL: $hashUrl" -Level Verbose
-
-        $hashDownloadFailed = $false
-        try {
-            # Download hash file using same auth method as package
-            if ($authType -eq "SAS") {
-                # Extract SAS token from hash URL or use package SAS token
-                $hashSasToken = if ($hashUrl -match '\?(.+)$') {
-                    $matches[1]
-                } else {
-                    $config.packageSource.sasToken
-                }
-                Get-AzureBlobWithSAS -BlobUrl $hashUrl -SasToken $hashSasToken -Destination $hashFile
-            }
-            elseif ($authType -eq "Anonymous") {
-                Get-AzureBlobAnonymous -BlobUrl $hashUrl -Destination $hashFile
-            }
-            elseif ($authType -eq "SMB") {
-                $securePassword = $null
-                if ($config.packageSource.password) {
-                    $securePassword = ConvertTo-SecureString -String $config.packageSource.password -AsPlainText -Force
-                }
-
-                if ($config.packageSource.username -and $securePassword) {
-                    Get-SMBFile -UncPath $hashUrl -Destination $hashFile -Username $config.packageSource.username -Password $securePassword
-                }
-                else {
-                    Get-SMBFile -UncPath $hashUrl -Destination $hashFile
-                }
-            }
-            else {
-                # Auto-detect
-                if ($hashUrl -match '^\\\\') {
-                    Get-SMBFile -UncPath $hashUrl -Destination $hashFile
-                }
-                elseif ($hashUrl -match '^https?://') {
-                    Get-AzureBlobAnonymous -BlobUrl $hashUrl -Destination $hashFile
-                }
-                else {
-                    Copy-Item -Path $hashUrl -Destination $hashFile -Force
-                }
-            }
-        }
-        catch {
-            $hashDownloadFailed = $true
-            if ($hashUrlExplicit) {
-                throw "Failed to download package hash file from explicit packageHashUrl: $($_.Exception.Message)"
-            }
-            else {
-                Write-DeploymentLog "Hash file not found at auto-discovered location - skipping hash validation" -Level Warning
-                Write-DeploymentLog "  Attempted URL: $hashUrl" -Level Verbose
-            }
-        }
-
-        # Only continue with validation if download succeeded
-        if (-not $hashDownloadFailed -and (Test-Path $hashFile)) {
-            Write-DeploymentLog "Hash file downloaded successfully" -Level Info
-
-        # Verify hash file signature if signature checking is enabled
-        if ($config.validation.enableSignatureCheck) {
-            Write-DeploymentLog "Verifying hash file signature..." -Level Info
-
-            $hashSignature = Get-AuthenticodeSignature -FilePath $hashFile
-
-            if ($hashSignature.Status -ne "Valid") {
-                $errorMsg = "Hash file signature is invalid: $($hashSignature.Status)"
-                if ($hashSignature.StatusMessage) {
-                    $errorMsg += " - $($hashSignature.StatusMessage)"
-                }
-
-                if ($config.validation.requireValidSignature) {
-                    throw $errorMsg
-                }
-                else {
-                    Write-DeploymentLog "WARNING: $errorMsg" -Level Warning
-                }
-            }
-            else {
-                Write-DeploymentLog "Hash file signature is valid" -Level Info
-
-                # Verify hash file signer is trusted
-                $cert = $hashSignature.SignerCertificate
-                $certThumbprint = $cert.Thumbprint
-                $certSubject = $cert.Subject
-                $certCN = if ($certSubject -match 'CN=([^,]+)') { $matches[1] } else { $certSubject }
-
-                Write-DeploymentLog "  Signer: $certCN" -Level Info
-                Write-DeploymentLog "  Thumbprint: $certThumbprint" -Level Verbose
-
-                # Check against trusted publishers (reuse same logic as Deploy-Windows.ps1 validation)
-                $isTrusted = $false
-
-                foreach ($trustedPublisher in $config.validation.trustedPublishers) {
-                    if ($trustedPublisher -like "Thumbprint:*") {
-                        $expectedThumbprint = $trustedPublisher -replace '^Thumbprint:', ''
-                        if ($certThumbprint -eq $expectedThumbprint) {
-                            Write-DeploymentLog "  Matched trusted thumbprint: $expectedThumbprint" -Level Info
-                            $isTrusted = $true
-                            break
-                        }
-                    }
-                    elseif ($trustedPublisher -like "CN:*") {
-                        $expectedCN = $trustedPublisher -replace '^CN:', ''
-                        if ($certCN -like "*$expectedCN*") {
-                            Write-DeploymentLog "  Matched trusted CN: $expectedCN" -Level Info
-                            $isTrusted = $true
-                            break
-                        }
-                    }
-                }
-
-                if (-not $isTrusted) {
-                    $errorMsg = "Hash file signer is not in trusted publishers list. Signer: $certCN (Thumbprint: $certThumbprint)"
-
-                    if ($config.validation.requireValidSignature) {
-                        throw $errorMsg
-                    }
-                    else {
-                        Write-DeploymentLog "WARNING: $errorMsg" -Level Warning
-                    }
-                }
-                else {
-                    Write-DeploymentLog "Hash file signer is trusted" -Level Info
-                }
-            }
-        }
-
-        # Load expected hash from hash file
-        Write-DeploymentLog "Loading expected hash..." -Level Info
-
-        try {
-            $expectedHashInfo = & $hashFile
-
-            if ($null -eq $expectedHashInfo) {
-                throw "Hash file returned null"
-            }
-
-            if ($expectedHashInfo -isnot [hashtable]) {
-                throw "Hash file must return a hashtable. Got: $($expectedHashInfo.GetType().Name)"
-            }
-
-            if (-not $expectedHashInfo.hash) {
-                throw "Hash file missing 'hash' property"
-            }
-
-            if (-not $expectedHashInfo.algorithm) {
-                throw "Hash file missing 'algorithm' property"
-            }
-
-            Write-DeploymentLog "  Expected hash: $($expectedHashInfo.hash)" -Level Verbose
-            Write-DeploymentLog "  Algorithm: $($expectedHashInfo.algorithm)" -Level Info
-            if ($expectedHashInfo.fileName) {
-                Write-DeploymentLog "  Expected filename: $($expectedHashInfo.fileName)" -Level Info
-            }
-        }
-        catch {
-            throw "Failed to load hash from hash file: $($_.Exception.Message)"
-        }
-
-        # Calculate actual hash of downloaded package
-        Write-DeploymentLog "Calculating package hash..." -Level Info
-
-        try {
-            $actualHash = Get-FileHash -Path $packageFile -Algorithm $expectedHashInfo.algorithm -ErrorAction Stop
-            Write-DeploymentLog "  Actual hash: $($actualHash.Hash)" -Level Verbose
-        }
-        catch {
-            throw "Failed to calculate package hash: $($_.Exception.Message)"
-        }
-
-        # Verify hashes match
-        if ($actualHash.Hash -ne $expectedHashInfo.hash) {
-            $errorMsg = @"
-PACKAGE HASH MISMATCH!
-
-Expected: $($expectedHashInfo.hash)
-Actual:   $($actualHash.Hash)
-Algorithm: $($expectedHashInfo.algorithm)
-
-The downloaded package has been modified or corrupted.
-This could indicate tampering or incomplete download.
-"@
-            throw $errorMsg
-        }
-
-        Write-DeploymentLog "Package hash verification PASSED" -Level Info
-        Write-DeploymentLog "  Hash: $($actualHash.Hash)" -Level Info
-
-            # Optional: Verify filename matches
-            if ($expectedHashInfo.fileName) {
-                $actualFileName = Split-Path -Leaf $packageFile
-                if ($actualFileName -ne $expectedHashInfo.fileName) {
-                    Write-DeploymentLog "WARNING: Package filename mismatch. Expected: $($expectedHashInfo.fileName), Actual: $actualFileName" -Level Warning
-                }
-            }
-        }
-        # End of if (-not $hashDownloadFailed -and (Test-Path $hashFile))
-    }
-    else {
-        Write-DeploymentLog "Package hash validation not configured - no hash file found" -Level Info
+    # Cleanup catalog file
+    if (Test-Path $catalogFile) {
+        Remove-Item $catalogFile -Force -ErrorAction SilentlyContinue
     }
     #endregion
 

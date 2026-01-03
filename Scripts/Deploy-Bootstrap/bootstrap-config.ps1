@@ -4,7 +4,7 @@
 
 return @{
     packageSource = @{
-        blobUrl = "https://mystorageaccount.blob.core.windows.net/deployment/DeploymentPackage.zip"
+        blobUrl = "https://raw.githubusercontent.com/jamieelliston/Deployer/refs/heads/master/Scripts/Deploy-Bootstrap.zip"
         authType = "Anonymous"
         # NOTE: catalogUrl removed - Deploy-Windows.ps1 signature validated directly
     }
@@ -12,7 +12,7 @@ return @{
     validation = @{
         enableSignatureCheck = $true
         trustedPublishers = @(
-            "Thumbprint:A1B2C3D4E5F6789012345678901234567890ABCD"
+            "CN:Local Code Signing Cert"  # Updated to match actual certificate CN
         )
         requireValidSignature = $true
     }
